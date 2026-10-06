@@ -7,6 +7,7 @@ Compilar a .exe (Windows):  python build.py
 """
 import base64
 import csv
+import hashlib
 import json
 import os
 import random
@@ -17,6 +18,7 @@ import select
 import socket
 import sys
 import struct
+import subprocess
 import threading
 import time
 import tkinter as tk
@@ -26,7 +28,7 @@ from tkinter import ttk, filedialog, messagebox
 
 from lang import LANGUAGES, Translator, detect_system_language
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 APP_NAME = "UbiDiscover"
 REPO = "acoll90/ubidiscover"
 WEB_URL = "https://www.acollbordas.com"
@@ -286,15 +288,94 @@ def _ver_tuple(v):
     return tuple(out)
 
 
+def _http(url, timeout=30, accept=None):
+    headers = {"User-Agent": f"{APP_NAME}/{__version__}"}
+    if accept:
+        headers["Accept"] = accept
+    return urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout)
+
+
 def check_latest_release(timeout=5):
-    """Retorna (tag, url) de la darrera release de GitHub, o None si falla."""
-    req = urllib.request.Request(
-        f"https://api.github.com/repos/{REPO}/releases/latest",
-        headers={"Accept": "application/vnd.github+json",
-                 "User-Agent": f"{APP_NAME}/{__version__}"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    """Retorna (tag, url_pàgina, {nom_fitxer: url_descàrrega}) de la darrera release."""
+    with _http(f"https://api.github.com/repos/{REPO}/releases/latest",
+               timeout, "application/vnd.github+json") as r:
         data = json.load(r)
-    return data.get("tag_name", ""), data.get("html_url", REPO_URL + "/releases")
+    assets = {a["name"]: a["browser_download_url"] for a in data.get("assets", [])}
+    return data.get("tag_name", ""), data.get("html_url", REPO_URL + "/releases"), assets
+
+
+def install_mode():
+    """'setup' si s'ha instal·lat amb l'instal·lador, 'portable' si és l'.exe
+    solt, o None si s'executa des del codi font (no es pot autoactualitzar)."""
+    if not getattr(sys, "frozen", False) or os.name != "nt":
+        return None
+    folder = os.path.dirname(sys.executable)
+    return "setup" if os.path.exists(os.path.join(folder, "unins000.exe")) else "portable"
+
+
+def download_file(url, dest, progress=None):
+    with _http(url, timeout=60) as r, open(dest, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        done = 0
+        while True:
+            chunk = r.read(65536)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            if progress:
+                progress(done, total)
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest().lower()
+
+
+def parse_sha256sums(text):
+    out = {}
+    for line in text.splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 2:
+            out[parts[-1].lstrip("*")] = parts[0].lower()
+    return out
+
+
+def write_update_script(mode, new_file, exe, workdir):
+    """Script .cmd que espera que l'app es tanqui, aplica l'actualització,
+    torna a obrir l'app i s'esborra."""
+    name = os.path.basename(exe)
+    pids = [os.getpid(), os.getppid()]   # amb --onefile hi ha 2 processos
+    waits = "\n".join(
+        f'tasklist /FI "PID eq {p}" /FI "IMAGENAME eq {name}" /NH 2>nul | find "{p}" >nul '
+        f'&& (timeout /t 1 /nobreak >nul & goto wait)' for p in pids)
+    if mode == "setup":
+        apply = f'"{new_file}" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-'
+    else:
+        apply = f"""set R=0
+:mv
+set /a R+=1
+move /y "{new_file}" "{exe}" >nul 2>&1
+if errorlevel 1 if %R% lss 30 (timeout /t 1 /nobreak >nul & goto mv)"""
+    script = f"""@echo off
+chcp 65001 >nul
+set N=0
+:wait
+set /a N+=1
+if %N% gtr 60 goto go
+{waits}
+:go
+{apply}
+start "" "{exe}"
+(goto) 2>nul & rd /s /q "{workdir}"
+"""
+    path = os.path.join(workdir, "update.cmd")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(script.replace("\n", "\r\n"))
+    return path
 
 
 # ---------------------------------------------------------------- GUI
@@ -304,6 +385,8 @@ class App(tk.Tk):
         self.cfg = load_config()
         T.set(self.cfg.get("language") or detect_system_language())
         self.lang_var = tk.StringVar(value=T.lang)
+        self.auto_update_var = tk.BooleanVar(value=bool(self.cfg.get("auto_update", False)))
+        self.upd_win = None
         self.title(f"{APP_NAME} v{__version__}")
         try:
             self.iconbitmap(resource_path(os.path.join("assets", "ubidiscover.ico")))
@@ -398,6 +481,8 @@ class App(tk.Tk):
                                command=self.set_language)
         hm = tk.Menu(mb, tearoff=0)
         hm.add_command(label=T("menu_updates"), command=lambda: self.check_updates(manual=True))
+        hm.add_checkbutton(label=T("menu_auto_update"), variable=self.auto_update_var,
+                           command=self.toggle_auto_update)
         hm.add_command(label=T("menu_donate"), command=self.donate)
         hm.add_separator()
         hm.add_command(label=T("menu_web"), command=lambda: webbrowser.open(WEB_URL))
@@ -411,21 +496,83 @@ class App(tk.Tk):
     def check_updates(self, manual):
         def worker():
             try:
-                tag, url = check_latest_release()
+                tag, url, assets = check_latest_release()
             except Exception as e:
                 if manual:
                     self.q.put(("status", T("st_update_err", err=e)))
                 return
             newer = bool(tag) and _ver_tuple(tag) > _ver_tuple(__version__)
             if newer or manual:
-                self.q.put(("update", (tag, url, newer)))
+                self.q.put(("update", (tag, url, newer, assets, manual)))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _show_update(self, tag, url, newer):
+    def _show_update(self, tag, url, newer, assets, manual):
         if not newer:
             messagebox.showinfo(T("upd_title"), T("upd_latest", ver=__version__))
             return
-        if messagebox.askyesno(T("upd_new_title"), T("upd_new_msg", tag=tag, ver=__version__)):
+        auto = self.auto_update_var.get() and not manual and install_mode()
+        if auto or messagebox.askyesno(
+                T("upd_new_title"), T("upd_new_msg", tag=tag, ver=__version__, app=APP_NAME)):
+            self.start_update(tag, url, assets)
+
+    def toggle_auto_update(self):
+        self.cfg["auto_update"] = bool(self.auto_update_var.get())
+        save_config(self.cfg)
+
+    def start_update(self, tag, url, assets):
+        mode = install_mode()
+        if not mode:                      # executant-se des del .py
+            webbrowser.open(url)
+            return
+        ver = tag.lstrip("vV")
+        name = f"{APP_NAME}-{ver}-{'setup' if mode == 'setup' else 'portable'}.exe"
+        if name not in assets:
+            self._update_failed(T("upd_no_asset", name=name), url)
+            return
+
+        win = tk.Toplevel(self)
+        win.title(T("upd_progress_title", app=APP_NAME))
+        win.resizable(False, False)
+        win.transient(self)
+        win.protocol("WM_DELETE_WINDOW", lambda: None)
+        frm = ttk.Frame(win, padding=16)
+        frm.pack()
+        self.upd_label = ttk.Label(frm, text=T("upd_downloading", tag=tag), width=46)
+        self.upd_label.pack(anchor="w")
+        self.upd_bar = ttk.Progressbar(frm, length=320, mode="determinate", maximum=100)
+        self.upd_bar.pack(pady=(8, 0))
+        self.upd_win = win
+
+        def worker():
+            try:
+                workdir = tempfile.mkdtemp(prefix="ubidiscover_update_")
+                dest = os.path.join(workdir, name)
+                download_file(assets[name], dest,
+                              lambda d, t: self.q.put(("upd_progress", (d, t))))
+                if "SHA256SUMS.txt" in assets:
+                    self.q.put(("upd_text", T("upd_verifying")))
+                    with _http(assets["SHA256SUMS.txt"]) as r:
+                        sums = parse_sha256sums(r.read().decode("utf-8", "replace"))
+                    if sums.get(name) != sha256_file(dest):
+                        raise RuntimeError(T("upd_bad_hash"))
+                self.q.put(("upd_ready", (mode, dest, workdir)))
+            except Exception as e:
+                self.q.put(("upd_error", (str(e), url)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_update(self, mode, new_file, workdir):
+        self.upd_label.config(text=T("upd_restarting"))
+        self.update_idletasks()
+        script = write_update_script(mode, new_file, sys.executable, workdir)
+        subprocess.Popen(["cmd.exe", "/c", script], cwd=workdir, close_fds=True,
+                         creationflags=0x08000000 | 0x00000200)  # NO_WINDOW | NEW_PROCESS_GROUP
+        self.after(300, self.destroy)
+
+    def _update_failed(self, err, url):
+        if getattr(self, "upd_win", None):
+            self.upd_win.destroy()
+            self.upd_win = None
+        if messagebox.askyesno(T("upd_title"), T("upd_failed", err=err)):
             webbrowser.open(url)
 
     def donate(self):
@@ -513,6 +660,16 @@ class App(tk.Tk):
                     self.status.set(T("st_opened", url=data))
                 elif kind == "update":
                     self._show_update(*data)
+                elif kind == "upd_progress":
+                    done, total = data
+                    if total:
+                        self.upd_bar["value"] = done * 100 / total
+                elif kind == "upd_text":
+                    self.upd_label.config(text=data)
+                elif kind == "upd_ready":
+                    self._apply_update(*data)
+                elif kind == "upd_error":
+                    self._update_failed(*data)
                 elif kind == "tempip":
                     self.temp_ips.append(data)
                 elif kind == "unreachable":

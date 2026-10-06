@@ -15,7 +15,7 @@ Ves a **[Releases](https://github.com/acoll90/ubidiscover/releases/latest)** i b
 | `UbiDiscover-x.y.z-setup.exe` | Instal·lador (menú Inici, desinstal·lador, sense permisos d'administrador) |
 | `UbiDiscover-x.y.z-portable.exe` | Versió portable: un sol fitxer, no cal instal·lar res |
 
-L'eina comprova a l'inici si hi ha una versió nova.
+**Actualitzacions automàtiques**: en obrir-se, l'eina comprova si hi ha una versió nova. Si acceptes, la baixa, en verifica el SHA256, es tanca, s'actualitza (instal·lador o portable, segons com la facis servir) i es torna a obrir sola. Al menú *Ajuda → Actualitza automàticament* pots fer que ho faci sense preguntar.
 
 ## Funcionalitats
 
