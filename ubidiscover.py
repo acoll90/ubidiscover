@@ -24,7 +24,9 @@ import urllib.request
 import webbrowser
 from tkinter import ttk, filedialog, messagebox
 
-__version__ = "1.0.0"
+from lang import LANGUAGES, Translator, detect_system_language
+
+__version__ = "1.1.0"
 APP_NAME = "UbiDiscover"
 REPO = "acoll90/ubidiscover"
 WEB_URL = "https://www.acollbordas.com"
@@ -38,11 +40,34 @@ PROBES = (b"\x01\x00\x00\x00", b"\x02\x08\x00\x00")
 MAX_HOSTS = 65536
 WMODES = {2: "Station", 3: "AP"}
 
-COLS = (
-    ("ip", "IP", 120), ("ips", "Altres IPs", 130), ("mac", "MAC", 130), ("hostname", "Nom", 170),
-    ("model", "Model", 170), ("firmware", "Firmware", 230),
-    ("essid", "SSID", 130), ("wmode", "Mode", 70), ("uptime", "Uptime", 90),
+COLS = (  # (clau, amplada); el títol surt de lang.py com a "col_<clau>"
+    ("ip", 120), ("ips", 130), ("mac", 130), ("hostname", 170),
+    ("model", 170), ("firmware", 230), ("essid", 130), ("wmode", 80), ("uptime", 100),
 )
+
+T = Translator()
+
+
+def config_path():
+    base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, APP_NAME, "config.json")
+
+
+def load_config():
+    try:
+        with open(config_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg):
+    try:
+        os.makedirs(os.path.dirname(config_path()), exist_ok=True)
+        with open(config_path(), "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------- protocol
@@ -276,12 +301,14 @@ def check_latest_release(timeout=5):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        self.cfg = load_config()
+        T.set(self.cfg.get("language") or detect_system_language())
+        self.lang_var = tk.StringVar(value=T.lang)
         self.title(f"{APP_NAME} v{__version__}")
         try:
             self.iconbitmap(resource_path(os.path.join("assets", "ubidiscover.ico")))
         except Exception:
             pass
-        self._build_menubar()
         self.geometry("1150x520")
         self.q = queue.Queue()
         self.rows = {}
@@ -292,27 +319,32 @@ class App(tk.Tk):
 
         bar = ttk.Frame(self, padding=6)
         bar.pack(fill="x")
-        self.btn_local = ttk.Button(bar, text="Escaneja xarxa local", command=self.scan_local)
+        self.btn_local = ttk.Button(bar, command=self.scan_local)
         self.btn_local.pack(side="left")
-        ttk.Label(bar, text="Rang (CIDR):").pack(side="left", padx=(14, 3))
+        self.lbl_range = ttk.Label(bar)
+        self.lbl_range.pack(side="left", padx=(14, 3))
         self.range_var = tk.StringVar()
         ent = ttk.Entry(bar, textvariable=self.range_var, width=20)
         ent.pack(side="left")
         ent.bind("<Return>", lambda e: self.scan_range())
-        self.btn_range = ttk.Button(bar, text="Escaneja rang", command=self.scan_range)
+        self.btn_range = ttk.Button(bar, command=self.scan_range)
         self.btn_range.pack(side="left", padx=4)
-        ttk.Label(bar, text="Temps (s):").pack(side="left", padx=(14, 3))
+        self.lbl_timeout = ttk.Label(bar)
+        self.lbl_timeout.pack(side="left", padx=(14, 3))
         self.timeout_var = tk.IntVar(value=4)
         ttk.Spinbox(bar, from_=1, to=30, textvariable=self.timeout_var, width=4).pack(side="left")
-        ttk.Button(bar, text="♥ Dona suport", command=self.donate).pack(side="right", padx=(8, 0))
-        ttk.Button(bar, text="Exporta CSV", command=self.export).pack(side="right")
-        ttk.Button(bar, text="Neteja", command=self.clear).pack(side="right", padx=4)
+        self.btn_donate = ttk.Button(bar, command=self.donate)
+        self.btn_donate.pack(side="right", padx=(8, 0))
+        self.btn_export = ttk.Button(bar, command=self.export)
+        self.btn_export.pack(side="right")
+        self.btn_clear = ttk.Button(bar, command=self.clear)
+        self.btn_clear.pack(side="right", padx=4)
 
         frame = ttk.Frame(self)
         frame.pack(fill="both", expand=True, padx=6)
         self.tree = ttk.Treeview(frame, columns=[c[0] for c in COLS], show="headings")
-        for key, title, w in COLS:
-            self.tree.heading(key, text=title, command=lambda k=key: self.sort(k))
+        for key, w in COLS:
+            self.tree.heading(key, command=lambda k=key: self.sort(k))
             self.tree.column(key, width=w, anchor="w")
         sb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
@@ -321,30 +353,59 @@ class App(tk.Tk):
         self.tree.bind("<Double-1>", lambda e: self.open_web())
         self.tree.bind("<Button-3>", self.popup)
 
-        self.menu = tk.Menu(self, tearoff=0)
-        self.menu.add_command(label="Obre web (https)", command=self.open_web)
-        self.menu.add_command(label="Copia IP", command=lambda: self.copy(0))
-        self.menu.add_command(label="Copia MAC", command=lambda: self.copy(2))
-        self.menu.add_separator()
-        self.menu.add_command(label="Treu IPs temporals del PC", command=self.remove_temp_ips)
-
-        self.status = tk.StringVar(value="Llest. IPs locals: " + ", ".join(local_ipv4s()))
+        self.status = tk.StringVar()
         ttk.Label(self, textvariable=self.status, padding=6, anchor="w").pack(fill="x")
+        self.retranslate()
+        self.status.set(T("st_ready", ips=", ".join(local_ipv4s())))
         self.after(100, self.poll)
         self.after(1500, lambda: self.check_updates(manual=False))
 
     # --- menú, actualitzacions i donacions
+    def retranslate(self):
+        """Aplica l'idioma actual a tots els textos de la finestra."""
+        self.btn_local.config(text=T("btn_scan_local"))
+        self.lbl_range.config(text=T("lbl_range"))
+        self.btn_range.config(text=T("btn_scan_range"))
+        self.lbl_timeout.config(text=T("lbl_timeout"))
+        self.btn_donate.config(text=T("btn_donate"))
+        self.btn_export.config(text=T("btn_export"))
+        self.btn_clear.config(text=T("btn_clear"))
+        for key, _ in COLS:
+            self.tree.heading(key, text=T(f"col_{key}"))
+        self._build_ctx_menu()
+        self._build_menubar()
+
+    def set_language(self):
+        T.set(self.lang_var.get())
+        self.cfg["language"] = T.lang
+        save_config(self.cfg)
+        self.retranslate()
+        self.status.set(T("st_ready", ips=", ".join(local_ipv4s())))
+
+    def _build_ctx_menu(self):
+        self.menu = tk.Menu(self, tearoff=0)
+        self.menu.add_command(label=T("ctx_open"), command=self.open_web)
+        self.menu.add_command(label=T("ctx_copy_ip"), command=lambda: self.copy(0))
+        self.menu.add_command(label=T("ctx_copy_mac"), command=lambda: self.copy(2))
+        self.menu.add_separator()
+        self.menu.add_command(label=T("ctx_remove_temp"), command=self.remove_temp_ips)
+
     def _build_menubar(self):
         mb = tk.Menu(self)
+        lm = tk.Menu(mb, tearoff=0)
+        for code, name in LANGUAGES.items():
+            lm.add_radiobutton(label=name, value=code, variable=self.lang_var,
+                               command=self.set_language)
         hm = tk.Menu(mb, tearoff=0)
-        hm.add_command(label="Comprova actualitzacions", command=lambda: self.check_updates(manual=True))
-        hm.add_command(label="Fes una donació", command=self.donate)
+        hm.add_command(label=T("menu_updates"), command=lambda: self.check_updates(manual=True))
+        hm.add_command(label=T("menu_donate"), command=self.donate)
         hm.add_separator()
-        hm.add_command(label="Web: acollbordas.com", command=lambda: webbrowser.open(WEB_URL))
-        hm.add_command(label="Codi a GitHub", command=lambda: webbrowser.open(REPO_URL))
+        hm.add_command(label=T("menu_web"), command=lambda: webbrowser.open(WEB_URL))
+        hm.add_command(label=T("menu_github"), command=lambda: webbrowser.open(REPO_URL))
         hm.add_separator()
-        hm.add_command(label=f"Quant a {APP_NAME}", command=self.about)
-        mb.add_cascade(label="Ajuda", menu=hm)
+        hm.add_command(label=T("menu_about", app=APP_NAME), command=self.about)
+        mb.add_cascade(label=T("menu_language"), menu=lm)
+        mb.add_cascade(label=T("menu_help"), menu=hm)
         self.config(menu=mb)
 
     def check_updates(self, manual):
@@ -353,7 +414,7 @@ class App(tk.Tk):
                 tag, url = check_latest_release()
             except Exception as e:
                 if manual:
-                    self.q.put(("status", f"No s'ha pogut comprovar actualitzacions: {e}"))
+                    self.q.put(("status", T("st_update_err", err=e)))
                 return
             newer = bool(tag) and _ver_tuple(tag) > _ver_tuple(__version__)
             if newer or manual:
@@ -362,22 +423,20 @@ class App(tk.Tk):
 
     def _show_update(self, tag, url, newer):
         if not newer:
-            messagebox.showinfo("Actualitzacions", f"Tens la darrera versió (v{__version__}).")
+            messagebox.showinfo(T("upd_title"), T("upd_latest", ver=__version__))
             return
-        if messagebox.askyesno("Nova versió disponible",
-                               f"Hi ha una versió nova: {tag}\nTu tens v{__version__}.\n\n"
-                               "Vols obrir la pàgina de descàrrega?"):
+        if messagebox.askyesno(T("upd_new_title"), T("upd_new_msg", tag=tag, ver=__version__)):
             webbrowser.open(url)
 
     def donate(self):
         win = tk.Toplevel(self)
-        win.title("Dona suport")
+        win.title(T("don_title"))
         win.resizable(False, False)
         win.transient(self)
         frm = ttk.Frame(win, padding=16)
         frm.pack()
-        ttk.Label(frm, text=f"{APP_NAME} és gratuït.", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        ttk.Label(frm, text="Si t'és útil, pots convidar-me a un cafè via PayPal:",
+        ttk.Label(frm, text=T("don_free_app", app=APP_NAME), font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        ttk.Label(frm, text=T("don_text"),
                   wraplength=320).pack(anchor="w", pady=(4, 10))
         row = ttk.Frame(frm)
         row.pack(fill="x")
@@ -386,14 +445,14 @@ class App(tk.Tk):
                        command=lambda a=amt: self._paypal(a, win)).pack(side="left", padx=3)
         free = ttk.Frame(frm)
         free.pack(fill="x", pady=(12, 0))
-        ttk.Label(free, text="Import lliure:").pack(side="left")
+        ttk.Label(free, text=T("don_amount")).pack(side="left")
         amount = tk.StringVar()
         ent = ttk.Entry(free, textvariable=amount, width=8)
         ent.pack(side="left", padx=4)
         ttk.Label(free, text="€").pack(side="left")
-        ttk.Button(free, text="Dona",
+        ttk.Button(free, text=T("don_button"),
                    command=lambda: self._paypal(amount.get(), win)).pack(side="left", padx=8)
-        ttk.Label(frm, text="Gràcies! ♥", foreground="#c0392b").pack(anchor="w", pady=(12, 0))
+        ttk.Label(frm, text=T("don_thanks"), foreground="#c0392b").pack(anchor="w", pady=(12, 0))
         ent.focus_set()
 
     def _paypal(self, amount, win=None):
@@ -403,7 +462,7 @@ class App(tk.Tk):
             if val <= 0:
                 raise ValueError
         except ValueError:
-            messagebox.showerror("Import", "Introdueix un import vàlid.", parent=win)
+            messagebox.showerror(T("err_amount_title"), T("err_amount"), parent=win)
             return
         val_txt = f"{val:.2f}".rstrip("0").rstrip(".")
         webbrowser.open(f"{PAYPAL_URL}/{val_txt}EUR")
@@ -412,18 +471,14 @@ class App(tk.Tk):
 
     def about(self):
         messagebox.showinfo(
-            f"Quant a {APP_NAME}",
-            f"{APP_NAME} v{__version__}\n\n"
-            "Descobridor de dispositius Ubiquiti (airOS, UniFi, EdgeMAX...).\n\n"
-            "Albert Coll Bordas\n"
-            f"{WEB_URL}\n{REPO_URL}\n\n"
-            "Programari lliure (llicència MIT).")
+            T("menu_about", app=APP_NAME),
+            f"{APP_NAME} v{__version__}\n\n" + T("about_text", web=WEB_URL, repo=REPO_URL))
 
     # --- accions
     def _start(self, targets):
         self.btn_local.state(["disabled"])
         self.btn_range.state(["disabled"])
-        self.status.set("Escanejant...")
+        self.status.set(T("st_scanning"))
         threading.Thread(target=scan, daemon=True,
                          args=(local_ipv4s(), targets, self.timeout_var.get(), self.q)).start()
 
@@ -435,10 +490,10 @@ class App(tk.Tk):
         try:
             net = ipaddress.ip_network(txt, strict=False)
         except ValueError:
-            messagebox.showerror("Rang", "Format no vàlid. Exemple: 10.20.0.0/24")
+            messagebox.showerror(T("err_range_title"), T("err_range_format"))
             return
         if net.num_addresses > MAX_HOSTS:
-            messagebox.showerror("Rang", f"Massa adreces (màx {MAX_HOSTS}).")
+            messagebox.showerror(T("err_range_title"), T("err_range_big", max=MAX_HOSTS))
             return
         hosts = [str(h) for h in net.hosts()] or [str(net.network_address)]
         self._start(hosts)
@@ -455,7 +510,7 @@ class App(tk.Tk):
                     self.status.set(data)
                 elif kind == "open":
                     webbrowser.open(data)
-                    self.status.set(f"Obert {data}")
+                    self.status.set(T("st_opened", url=data))
                 elif kind == "update":
                     self._show_update(*data)
                 elif kind == "tempip":
@@ -465,7 +520,7 @@ class App(tk.Tk):
                 elif kind == "done":
                     self.btn_local.state(["!disabled"])
                     self.btn_range.state(["!disabled"])
-                    self.status.set(f"Fet. {len(self.rows)} dispositius trobats.")
+                    self.status.set(T("st_done", n=len(self.rows)))
         except queue.Empty:
             pass
         self.after(100, self.poll)
@@ -481,12 +536,12 @@ class App(tk.Tk):
         info["via"] = info.get("via") or prev.get("via", "")
         self.data[key] = info
         view = dict(info, ips=", ".join(allips[1:]))
-        vals = [view.get(k, "") for k, _, _ in COLS]
+        vals = [view.get(k, "") for k, _ in COLS]
         if key in self.rows:
             self.tree.item(self.rows[key], values=vals)
         else:
             self.rows[key] = self.tree.insert("", "end", values=vals)
-        self.status.set(f"Escanejant... {len(self.rows)} trobats")
+        self.status.set(T("st_scanning_n", n=len(self.rows)))
 
     def clear(self):
         self.tree.delete(*self.tree.get_children())
@@ -525,7 +580,7 @@ class App(tk.Tk):
         dev = self._selected_dev()
         if not dev:
             return
-        self.status.set("Comprovant quina IP respon...")
+        self.status.set(T("st_checking"))
         threading.Thread(target=self._open_worker, args=(dev,), daemon=True).start()
 
     def _open_worker(self, dev):
@@ -540,21 +595,16 @@ class App(tk.Tk):
         # Prioritza la 169.254 (link-local), si no la primera IP anunciada
         target = next((ip for ip in dev["all"] if ip.startswith("169.254.")), dev["all"][0])
         if os.name != "nt":
-            self.status.set(f"No hi ha accés a {target}. Afegeix una IP del seu rang a la targeta.")
+            self.status.set(T("st_no_access", ip=target))
             return
         known = {ip for d in self.data.values() for ip in d.get("all", [])}
         cands, prefix = temp_ip_candidates(target, known)
         rang = "169.254.0.0/16" if prefix == 16 else target.rsplit(".", 1)[0] + ".0/24"
         ok = messagebox.askyesno(
-            "Equip no accessible",
-            f"No hi ha connexió amb {', '.join(dev['all'])}.\n\n"
-            f"Vols afegir una IP temporal lliure del rang {rang} a la targeta "
-            f"de xarxa per arribar a {target}?\n"
-            f"(es comprova per ARP que no estigui ocupada; primera opció: {cands[0]})\n\n"
-            "Cal permís d'administrador. La IP desapareix en reiniciar "
-            "o des del menú 'Treu IPs temporals'.")
+            T("tmp_title"),
+            T("tmp_msg", ips=", ".join(dev["all"]), range=rang, target=target, first=cands[0]))
         if not ok:
-            self.status.set("Cancel·lat")
+            self.status.set(T("st_cancelled"))
             return
         outfile = os.path.join(tempfile.gettempdir(), f"ubidiscover_{os.getpid()}.txt")
         try:
@@ -562,9 +612,9 @@ class App(tk.Tk):
         except OSError:
             pass
         if not run_elevated_ps(ps_add_ip(dev.get("via", ""), cands, prefix, outfile)):
-            self.status.set("No s'ha pogut executar com a administrador")
+            self.status.set(T("st_no_admin"))
             return
-        self.status.set("Buscant una IP lliure (comprovació ARP)...")
+        self.status.set(T("st_finding_ip"))
         threading.Thread(target=self._wait_temp_ip, args=(outfile, target), daemon=True).start()
 
     def _wait_temp_ip(self, outfile, target):
@@ -584,13 +634,13 @@ class App(tk.Tk):
             except OSError:
                 pass
             if res == "FAIL":
-                self.q.put(("status", "Totes les IPs provades estan ocupades o no s'han pogut afegir"))
+                self.q.put(("status", T("st_all_busy")))
                 return
             self.q.put(("tempip", res))
-            self.q.put(("status", f"IP temporal {res} afegida. Esperant que {target} respongui..."))
+            self.q.put(("status", T("st_temp_added", ip=res, target=target)))
             self._wait_and_open(target)
             return
-        self.q.put(("status", "Temps esgotat esperant la IP temporal (UAC cancel·lat?)"))
+        self.q.put(("status", T("st_temp_timeout")))
 
     def _wait_and_open(self, ip):
         deadline = time.monotonic() + 20
@@ -600,19 +650,19 @@ class App(tk.Tk):
                 self.q.put(("open", url))
                 return
             time.sleep(1)
-        self.q.put(("status", f"{ip} continua sense respondre"))
+        self.q.put(("status", T("st_no_response", ip=ip)))
 
     def remove_temp_ips(self):
         if not self.temp_ips:
-            self.status.set("No hi ha IPs temporals afegides")
+            self.status.set(T("st_no_temp"))
             return
         if os.name == "nt" and run_elevated_ps(ps_remove_ips(self.temp_ips)):
-            self.status.set(f"Eliminades: {', '.join(self.temp_ips)}")
+            self.status.set(T("st_removed", ips=", ".join(self.temp_ips)))
             self.temp_ips.clear()
 
     def on_close(self):
         if self.temp_ips and messagebox.askyesno(
-                "IPs temporals", "Vols treure les IPs temporals abans de sortir?"):
+                T("tmp_exit_title"), T("tmp_exit_msg")):
             self.remove_temp_ips()
         self.destroy()
 
@@ -637,10 +687,10 @@ class App(tk.Tk):
             return
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f, delimiter=";")
-            w.writerow([c[1] for c in COLS])
+            w.writerow([T(f"col_{c[0]}") for c in COLS])
             for item in self.tree.get_children():
                 w.writerow(self.tree.item(item, "values"))
-        self.status.set(f"Exportat a {path}")
+        self.status.set(T("st_exported", path=path))
 
 
 if __name__ == "__main__":

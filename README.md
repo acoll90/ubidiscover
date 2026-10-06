@@ -25,6 +25,7 @@ L'eina comprova a l'inici si hi ha una versió nova.
 - **Doble clic** per obrir l'equip al navegador: prova totes les IPs anunciades (HTTPS/HTTP) i obre la que respon.
 - **IP temporal automàtica**: si l'equip és en un altre segment (p. ex. de fàbrica a 192.168.1.20, o només amb 169.254.x.x), proposa afegir una IP temporal a la targeta. Abans de quedar-se-la, comprova per ARP (detecció de duplicats de Windows) que estigui lliure, i si no, en prova una altra.
 - Ordenació per columnes, copiar IP/MAC i exportació a CSV (compatible amb Excel).
+- **Multiidioma**: català, castellà, anglès, francès, italià, portuguès i alemany. Detecta l'idioma del sistema i es pot canviar al menú *Idioma*.
 
 ## Notes d'ús
 
@@ -35,11 +36,15 @@ L'eina comprova a l'inici si hi ha una versió nova.
 
 ## Executar des del codi
 
-Només cal Python 3.8+ (sense dependències externes):
+Només cal Python 3.8+ (sense dependències externes). L'idioma triat es desa a `%APPDATA%\UbiDiscover\config.json`.
 
 ```bash
 python ubidiscover.py
 ```
+
+## Afegir un idioma
+
+Les traduccions són a [`lang.py`](lang.py). Copia el bloc `"en"`, tradueix-ne els textos (sense tocar les `{claus}`) i afegeix el codi a `LANGUAGES`. Les contribucions són benvingudes!
 
 ## Compilar l'executable
 
